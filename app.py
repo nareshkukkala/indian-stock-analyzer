@@ -119,27 +119,138 @@ def fetch_stock_data(ticker: str, period: str, interval: str) -> pd.DataFrame:
 
 @st.cache_data(ttl=300)
 def fetch_info(ticker: str) -> dict:
+    """
+    Build a fundamental-data dict for `ticker` using multiple yfinance endpoints.
+    Priority: t.info → fast_info → income_stmt → balance_sheet → cash_flow → derived.
+    This multi-source approach ensures data is available even when t.info returns {}.
+    """
     try:
         t    = yf.Ticker(ticker)
-        info = dict(t.info or {})
-        # Supplement missing keys from fast_info (more reliable in yfinance 1.x)
+        info = {}
+
+        # ── 1. t.info (full metadata; may be empty / blocked on some servers) ──
+        for _attempt in range(2):
+            try:
+                raw = t.info
+                if isinstance(raw, dict) and len(raw) > 5:
+                    info = dict(raw)
+                    break
+            except Exception:
+                pass
+
+        # ── 2. fast_info – lighter endpoint, usually works everywhere ──────────
         try:
             fi = t.fast_info
-            fallbacks = {
-                "marketCap":         "market_cap",
-                "fiftyTwoWeekHigh":  "year_high",
-                "fiftyTwoWeekLow":   "year_low",
-                "sharesOutstanding": "shares",
-                "lastPrice":         "last_price",
+            fi_map = {
+                "marketCap":            "market_cap",
+                "fiftyTwoWeekHigh":     "year_high",
+                "fiftyTwoWeekLow":      "year_low",
+                "sharesOutstanding":    "shares",
+                "lastPrice":            "last_price",
+                "currency":             "currency",
+                "exchange":             "exchange",
+                "fiftyDayAverage":      "fifty_day_average",
+                "twoHundredDayAverage": "two_hundred_day_average",
+                "averageVolume":        "three_month_average_volume",
             }
-            for info_key, fi_attr in fallbacks.items():
-                if not info.get(info_key):
+            for key, attr in fi_map.items():
+                if not info.get(key):
                     try:
-                        info[info_key] = getattr(fi, fi_attr)
+                        val = getattr(fi, attr, None)
+                        if val is not None:
+                            info[key] = val
                     except Exception:
                         pass
         except Exception:
             pass
+
+        # Helper to pull a float from a financial-statement DataFrame
+        def _stmt(df, *row_names):
+            if df is None or df.empty:
+                return None
+            col = df.columns[0]
+            for name in row_names:
+                if name in df.index:
+                    try:
+                        val = df.loc[name, col]
+                        if pd.notna(val):
+                            return float(val)
+                    except Exception:
+                        pass
+            return None
+
+        # ── 3. Income statement ───────────────────────────────────────────────
+        _ni = None
+        try:
+            fin = t.income_stmt
+            if fin is not None and not fin.empty:
+                rev = _stmt(fin, "Total Revenue")
+                gp  = _stmt(fin, "Gross Profit")
+                op  = _stmt(fin, "Operating Income",
+                            "Total Operating Income As Reported")
+                ni  = _stmt(fin, "Net Income")
+                _ni = ni
+
+                if rev and not info.get("totalRevenue"):
+                    info["totalRevenue"] = rev
+                if rev and gp and not info.get("grossMargins"):
+                    info["grossMargins"] = gp / rev
+                if rev and op and not info.get("operatingMargins"):
+                    info["operatingMargins"] = op / rev
+                if rev and ni and not info.get("profitMargins"):
+                    info["profitMargins"] = ni / rev
+
+                shares = info.get("sharesOutstanding")
+                if ni and shares and shares > 0 and not info.get("trailingEps"):
+                    info["trailingEps"] = ni / shares
+        except Exception:
+            pass
+
+        # ── 4. Balance sheet ──────────────────────────────────────────────────
+        try:
+            bs = t.balance_sheet
+            if bs is not None and not bs.empty:
+                debt   = _stmt(bs, "Total Debt", "Long Term Debt")
+                equity = _stmt(bs, "Stockholders Equity", "Common Stock Equity")
+                assets = _stmt(bs, "Total Assets")
+
+                if debt   and not info.get("totalDebt"):
+                    info["totalDebt"] = debt
+                if _ni and equity and equity != 0 and not info.get("returnOnEquity"):
+                    info["returnOnEquity"] = _ni / equity
+                if _ni and assets  and assets  != 0 and not info.get("returnOnAssets"):
+                    info["returnOnAssets"] = _ni / assets
+
+                # P/B from book value per share
+                lp     = info.get("lastPrice")
+                shares = info.get("sharesOutstanding")
+                if lp and equity and shares and shares > 0 and not info.get("priceToBook"):
+                    bvps = equity / shares
+                    if bvps > 0:
+                        info["priceToBook"] = lp / bvps
+        except Exception:
+            pass
+
+        # ── 5. Cash-flow statement ────────────────────────────────────────────
+        try:
+            cf = t.cash_flow
+            if cf is not None and not cf.empty:
+                ocf = _stmt(cf, "Operating Cash Flow",
+                            "Cash Flow From Continuing Operating Activities")
+                if ocf and not info.get("operatingCashflow"):
+                    info["operatingCashflow"] = ocf
+        except Exception:
+            pass
+
+        # ── 6. Derived P/E ────────────────────────────────────────────────────
+        lp  = info.get("lastPrice")
+        eps = info.get("trailingEps")
+        if lp and eps and eps > 0 and not info.get("trailingPE"):
+            try:
+                info["trailingPE"] = lp / eps
+            except Exception:
+                pass
+
         return info
     except Exception:
         return {}
@@ -1042,6 +1153,22 @@ def sidebar_controls():
 
 def show_fundamentals(info: dict):
     st.subheader("Fundamental Analysis")
+
+    # Show notice if data is sparse (t.info likely failed; financial-statement fallbacks used)
+    key_fields = ["marketCap", "trailingPE", "totalRevenue", "priceToBook",
+                  "trailingEps", "profitMargins"]
+    filled = sum(1 for k in key_fields if info.get(k) is not None)
+    if filled == 0:
+        st.warning(
+            "⚠️ Fundamental data could not be loaded from Yahoo Finance for this ticker. "
+            "This can happen due to rate-limiting or network restrictions on the server. "
+            "Try refreshing the page or selecting a different time period to clear the cache."
+        )
+    elif filled < 3:
+        st.info(
+            "ℹ️ Some fundamental metrics are unavailable (retrieved from financial statements). "
+            "P/E, margins and debt figures may differ slightly from Yahoo Finance's displayed values."
+        )
 
     def g(key, default=None):
         return info.get(key, default)
