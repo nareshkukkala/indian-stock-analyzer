@@ -120,7 +120,27 @@ def fetch_stock_data(ticker: str, period: str, interval: str) -> pd.DataFrame:
 @st.cache_data(ttl=300)
 def fetch_info(ticker: str) -> dict:
     try:
-        return yf.Ticker(ticker).info
+        t    = yf.Ticker(ticker)
+        info = dict(t.info or {})
+        # Supplement missing keys from fast_info (more reliable in yfinance 1.x)
+        try:
+            fi = t.fast_info
+            fallbacks = {
+                "marketCap":         "market_cap",
+                "fiftyTwoWeekHigh":  "year_high",
+                "fiftyTwoWeekLow":   "year_low",
+                "sharesOutstanding": "shares",
+                "lastPrice":         "last_price",
+            }
+            for info_key, fi_attr in fallbacks.items():
+                if not info.get(info_key):
+                    try:
+                        info[info_key] = getattr(fi, fi_attr)
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+        return info
     except Exception:
         return {}
 
@@ -619,6 +639,330 @@ def show_target_stop_loss(levels: dict, sym: str = "₹"):
             st.warning("Stop loss is above entry price — check your inputs.")
 
 
+# ── Recommendation Engine ─────────────────────────────────────────────────────
+
+def calculate_recommendation(df: pd.DataFrame, info: dict) -> dict:
+    """Score-based Buy / Hold / Sell from technicals + fundamentals."""
+    if df.empty or len(df) < 3:
+        return {}
+
+    score     = 0
+    max_score = 0
+    factors   = []
+    last      = df.iloc[-1]
+    close     = float(last["Close"])
+
+    def _add(points, label, direction):
+        nonlocal score, max_score
+        abs_pts = abs(points)
+        max_score += abs_pts
+        score     += points
+        tag = "BUY" if points > 0 else ("SELL" if points < 0 else "HOLD")
+        factors.append({"Factor": label, "Signal": tag, "Points": f"{points:+d}"})
+
+    # ── Technical ──────────────────────────────────────────────────────────────
+    rsi = last.get("RSI", np.nan)
+    if not (isinstance(rsi, float) and np.isnan(rsi)):
+        rsi = float(rsi)
+        if   rsi < 30:  _add(+2, f"RSI Oversold ({rsi:.0f})",    "BUY")
+        elif rsi < 45:  _add(+1, f"RSI Mildly Bullish ({rsi:.0f})", "BUY")
+        elif rsi > 70:  _add(-2, f"RSI Overbought ({rsi:.0f})",  "SELL")
+        elif rsi > 55:  _add(-1, f"RSI Mildly Bearish ({rsi:.0f})", "SELL")
+        else:           _add( 0, f"RSI Neutral ({rsi:.0f})",     "HOLD"); max_score += 1
+
+    macd     = last.get("MACD",        np.nan)
+    macd_sig = last.get("MACD_signal", np.nan)
+    if not any(isinstance(v, float) and np.isnan(v) for v in [macd, macd_sig]):
+        if float(macd) > float(macd_sig):
+            _add(+2, "MACD above signal", "BUY")
+        else:
+            _add(-2, "MACD below signal", "SELL")
+
+    sma20  = last.get("SMA20",  np.nan)
+    sma50  = last.get("SMA50",  np.nan)
+    sma200 = last.get("SMA200", np.nan)
+    if not any(isinstance(v, float) and np.isnan(v) for v in [sma20, sma50]):
+        sma20, sma50 = float(sma20), float(sma50)
+        if   close > sma20 > sma50: _add(+2, "Price > SMA20 > SMA50", "BUY")
+        elif close < sma20 < sma50: _add(-2, "Price < SMA20 < SMA50", "SELL")
+        else:                       _add( 0, "Mixed MA alignment",     "HOLD"); max_score += 1
+
+    if not any(isinstance(v, float) and np.isnan(v) for v in [sma50, sma200]):
+        if float(sma50) > float(sma200): _add(+1, "Golden Cross (SMA50>200)", "BUY")
+        else:                             _add(-1, "Death Cross (SMA50<200)",  "SELL")
+
+    bb_upper = last.get("BB_upper", np.nan)
+    bb_lower = last.get("BB_lower", np.nan)
+    if not any(isinstance(v, float) and np.isnan(v) for v in [bb_upper, bb_lower]):
+        if   close < float(bb_lower): _add(+1, "Below lower Bollinger Band", "BUY")
+        elif close > float(bb_upper): _add(-1, "Above upper Bollinger Band", "SELL")
+
+    # ── Fundamental ───────────────────────────────────────────────────────────
+    pe = info.get("trailingPE")
+    if pe and pe > 0:
+        if   pe < 15: _add(+1, f"Attractive P/E ({pe:.1f})", "BUY")
+        elif pe > 50: _add(-1, f"Expensive P/E ({pe:.1f})",  "SELL")
+
+    pb = info.get("priceToBook")
+    if pb and pb > 0:
+        if   pb < 1: _add(+1, f"P/B below book ({pb:.2f})", "BUY")
+        elif pb > 6: _add(-1, f"High P/B ({pb:.2f})",       "SELL")
+
+    margin = info.get("profitMargins")
+    if margin is not None:
+        if   margin > 0.15: _add(+1, f"Strong margin ({margin*100:.1f}%)", "BUY")
+        elif margin < 0:    _add(-1, "Negative margin",                     "SELL")
+
+    if max_score == 0:
+        return {}
+
+    pct = (score / max_score) * 100
+    if   pct >= 35:  rec, color = "BUY",  "#00C853"
+    elif pct <= -35: rec, color = "SELL", "#FF1744"
+    else:            rec, color = "HOLD", "#FFC107"
+
+    confidence = min(abs(pct), 100)
+    return {
+        "recommendation": rec,
+        "color":          color,
+        "score":          score,
+        "max_score":      max_score,
+        "pct":            pct,
+        "confidence":     confidence,
+        "factors":        factors,
+    }
+
+
+# ── Risk Score ────────────────────────────────────────────────────────────────
+
+def calculate_risk_score(df: pd.DataFrame, info: dict) -> dict:
+    """Composite risk score: Low / Medium / High."""
+    if df.empty:
+        return {}
+
+    risk  = 0
+    total = 0
+    facts = []
+
+    def _risk(pts, label, detail):
+        nonlocal risk, total
+        total += 3
+        risk  += pts
+        level  = "🔴 High" if pts == 3 else ("🟡 Medium" if pts == 2 else "🟢 Low")
+        facts.append({"Factor": label, "Detail": detail, "Risk": level})
+
+    # Beta
+    beta = info.get("beta")
+    if beta is not None:
+        beta = float(beta)
+        if   beta > 1.5: _risk(3, "Market Beta", f"β = {beta:.2f} — high volatility vs index")
+        elif beta > 1.0: _risk(2, "Market Beta", f"β = {beta:.2f} — above-market volatility")
+        else:            _risk(1, "Market Beta", f"β = {beta:.2f} — low/defensive")
+
+    # ATR-based daily volatility
+    if "ATR" in df.columns:
+        close   = float(df["Close"].iloc[-1])
+        atr_val = df["ATR"].dropna()
+        if not atr_val.empty:
+            vol_pct = (float(atr_val.iloc[-1]) / close) * 100
+            if   vol_pct > 3.0: _risk(3, "Daily Volatility (ATR)", f"{vol_pct:.2f}% avg daily range")
+            elif vol_pct > 1.5: _risk(2, "Daily Volatility (ATR)", f"{vol_pct:.2f}% avg daily range")
+            else:               _risk(1, "Daily Volatility (ATR)", f"{vol_pct:.2f}% avg daily range")
+
+    # Debt load (Debt / Market Cap)
+    debt   = info.get("totalDebt")
+    mktcap = info.get("marketCap")
+    if debt and mktcap and mktcap > 0:
+        ratio = debt / mktcap
+        if   ratio > 0.6: _risk(3, "Debt / Mkt Cap", f"{ratio:.2f} — high leverage")
+        elif ratio > 0.3: _risk(2, "Debt / Mkt Cap", f"{ratio:.2f} — moderate leverage")
+        else:             _risk(1, "Debt / Mkt Cap", f"{ratio:.2f} — low leverage")
+
+    # 52-week range position
+    h52 = info.get("fiftyTwoWeekHigh")
+    l52 = info.get("fiftyTwoWeekLow")
+    if h52 and l52 and h52 != l52 and not df.empty:
+        pos = (float(df["Close"].iloc[-1]) - l52) / (h52 - l52)
+        if   pos < 0.25: _risk(3, "52W Position", f"{pos*100:.0f}% of range — near lows")
+        elif pos > 0.80: _risk(2, "52W Position", f"{pos*100:.0f}% of range — near highs")
+        else:            _risk(1, "52W Position", f"{pos*100:.0f}% of range — mid range")
+
+    # Profit margin
+    margin = info.get("profitMargins")
+    if margin is not None:
+        if   margin < 0:    _risk(3, "Profitability", f"Negative margin ({margin*100:.1f}%)")
+        elif margin < 0.05: _risk(2, "Profitability", f"Thin margin ({margin*100:.1f}%)")
+        else:               _risk(1, "Profitability", f"Healthy margin ({margin*100:.1f}%)")
+
+    if total == 0:
+        return {}
+
+    pct = (risk / total) * 100
+    if   pct >= 60: level, color, emoji = "HIGH",   "#FF1744", "🔴"
+    elif pct >= 35: level, color, emoji = "MEDIUM", "#FFC107", "🟡"
+    else:           level, color, emoji = "LOW",    "#00C853", "🟢"
+
+    return {"level": level, "color": color, "emoji": emoji, "pct": pct, "factors": facts}
+
+
+# ── Trend Reversal Alerts ─────────────────────────────────────────────────────
+
+def detect_alerts(df: pd.DataFrame) -> list:
+    """Return list of (emoji, title, description) alert tuples."""
+    alerts = []
+    if df.empty or len(df) < 3:
+        return alerts
+
+    close  = df["Close"].squeeze()
+    volume = df["Volume"].squeeze()
+
+    def _crossed_up(s1, s2):
+        return len(s1) >= 2 and len(s2) >= 2 and \
+               float(s1.iloc[-2]) < float(s2.iloc[-2]) and \
+               float(s1.iloc[-1]) > float(s2.iloc[-1])
+
+    def _crossed_dn(s1, s2):
+        return len(s1) >= 2 and len(s2) >= 2 and \
+               float(s1.iloc[-2]) > float(s2.iloc[-2]) and \
+               float(s1.iloc[-1]) < float(s2.iloc[-1])
+
+    # RSI crosses
+    if "RSI" in df.columns:
+        rsi = df["RSI"].dropna()
+        thirty  = pd.Series([30] * len(rsi), index=rsi.index)
+        seventy = pd.Series([70] * len(rsi), index=rsi.index)
+        if _crossed_up(rsi, thirty):
+            alerts.append(("🟢", "RSI Oversold Reversal",  "RSI crossed above 30 — potential bullish reversal"))
+        if _crossed_dn(rsi, seventy):
+            alerts.append(("🔴", "RSI Overbought Reversal","RSI crossed below 70 — potential bearish reversal"))
+
+    # MACD crossover
+    if "MACD" in df.columns and "MACD_signal" in df.columns:
+        macd = df["MACD"].dropna()
+        sig  = df["MACD_signal"].dropna()
+        if _crossed_up(macd, sig):
+            alerts.append(("🟢", "MACD Bullish Crossover", "MACD crossed above signal line"))
+        if _crossed_dn(macd, sig):
+            alerts.append(("🔴", "MACD Bearish Crossover", "MACD crossed below signal line"))
+
+    # Price vs SMA20
+    if "SMA20" in df.columns:
+        sma20 = df["SMA20"].dropna()
+        if _crossed_up(close.reindex(sma20.index), sma20):
+            alerts.append(("🟢", "Price crossed SMA20 ↑",  "Bullish: price moved above 20-day average"))
+        if _crossed_dn(close.reindex(sma20.index), sma20):
+            alerts.append(("🔴", "Price crossed SMA20 ↓",  "Bearish: price dropped below 20-day average"))
+
+    # Golden / Death cross
+    if "SMA50" in df.columns and "SMA200" in df.columns:
+        sma50  = df["SMA50"].dropna()
+        sma200 = df["SMA200"].dropna()
+        idx    = sma50.index.intersection(sma200.index)
+        if len(idx) >= 2:
+            s50, s200 = sma50.reindex(idx), sma200.reindex(idx)
+            if _crossed_up(s50, s200):
+                alerts.append(("🟢", "Golden Cross! SMA50 > SMA200", "Strong long-term bullish signal"))
+            if _crossed_dn(s50, s200):
+                alerts.append(("🔴", "Death Cross! SMA50 < SMA200",  "Strong long-term bearish signal"))
+
+    # Bollinger Band extremes
+    if "BB_upper" in df.columns and "BB_lower" in df.columns:
+        last_close = float(close.iloc[-1])
+        if last_close > float(df["BB_upper"].iloc[-1]):
+            alerts.append(("🟡", "Bollinger Upper Breakout", "Price above upper band — overbought or momentum"))
+        elif last_close < float(df["BB_lower"].iloc[-1]):
+            alerts.append(("🟡", "Bollinger Lower Breakdown","Price below lower band — oversold or downtrend"))
+
+    # Volume spike (≥ 2× 20-day average)
+    if "Vol_SMA20" in df.columns:
+        v_now = float(volume.iloc[-1])
+        v_avg = float(df["Vol_SMA20"].iloc[-1])
+        if v_avg > 0 and v_now >= 2 * v_avg:
+            alerts.append(("🟡", "Volume Spike Detected", f"Volume is {v_now/v_avg:.1f}× the 20-day average"))
+
+    if not alerts:
+        alerts.append(("✅", "No Active Alerts", "No trend reversal signals detected currently"))
+
+    return alerts
+
+
+# ── Display: Recommendation + Risk ───────────────────────────────────────────
+
+def show_recommendation_risk(rec: dict, risk: dict):
+    col_rec, col_risk = st.columns(2)
+
+    # Recommendation
+    with col_rec:
+        if rec:
+            r     = rec["recommendation"]
+            color = rec["color"]
+            conf  = rec["confidence"]
+            score = rec["score"]
+            mx    = rec["max_score"]
+            st.markdown(
+                f"<div style='background:rgba(0,0,0,0.3);border:2px solid {color};"
+                f"border-radius:12px;padding:1rem;text-align:center;'>"
+                f"<div style='font-size:0.85rem;color:#aaa;'>Overall Recommendation</div>"
+                f"<div style='font-size:2.4rem;font-weight:800;color:{color};letter-spacing:2px;'>{r}</div>"
+                f"<div style='font-size:0.8rem;color:#aaa;'>Confidence: {conf:.0f}% &nbsp;|&nbsp; Score: {score}/{mx}</div>"
+                f"</div>",
+                unsafe_allow_html=True,
+            )
+            with st.expander("View scoring factors"):
+                st.dataframe(pd.DataFrame(rec["factors"]), use_container_width=True, hide_index=True)
+        else:
+            st.info("Not enough data for recommendation.")
+
+    # Risk
+    with col_risk:
+        if risk:
+            lvl   = risk["level"]
+            color = risk["color"]
+            emoji = risk["emoji"]
+            pct   = risk["pct"]
+            st.markdown(
+                f"<div style='background:rgba(0,0,0,0.3);border:2px solid {color};"
+                f"border-radius:12px;padding:1rem;text-align:center;'>"
+                f"<div style='font-size:0.85rem;color:#aaa;'>Risk Score</div>"
+                f"<div style='font-size:2.4rem;font-weight:800;color:{color};'>{emoji} {lvl}</div>"
+                f"<div style='font-size:0.8rem;color:#aaa;'>Risk Index: {pct:.0f} / 100</div>"
+                f"</div>",
+                unsafe_allow_html=True,
+            )
+            with st.expander("View risk breakdown"):
+                st.dataframe(pd.DataFrame(risk["factors"]), use_container_width=True, hide_index=True)
+        else:
+            st.info("Not enough data for risk score.")
+
+
+# ── Display: Alerts ───────────────────────────────────────────────────────────
+
+def show_alerts(alerts: list):
+    st.subheader("🔔 Trend Reversal Alerts")
+    if not alerts:
+        st.info("No alerts.")
+        return
+
+    for emoji, title, desc in alerts:
+        if emoji == "🟢":
+            bg, border = "rgba(0,200,83,0.1)",  "#00C853"
+        elif emoji == "🔴":
+            bg, border = "rgba(255,23,68,0.1)",  "#FF1744"
+        elif emoji == "🟡":
+            bg, border = "rgba(255,193,7,0.1)",  "#FFC107"
+        else:
+            bg, border = "rgba(100,100,100,0.1)","#888"
+
+        st.markdown(
+            f"<div style='background:{bg};border-left:4px solid {border};"
+            f"border-radius:6px;padding:0.6rem 1rem;margin-bottom:0.5rem;'>"
+            f"<strong>{emoji} {title}</strong><br>"
+            f"<span style='font-size:0.85rem;color:#ccc;'>{desc}</span>"
+            f"</div>",
+            unsafe_allow_html=True,
+        )
+
+
 # ── Market Overview ─────────────────────────────────────────────────────────────
 
 def show_market_overview():
@@ -702,7 +1046,23 @@ def show_fundamentals(info: dict):
     def g(key, default=None):
         return info.get(key, default)
 
-    # Key metrics grid
+    def fmt_div(val):
+        """yfinance 1.x returns dividendYield already as a % value (e.g. 0.39 = 0.39%)."""
+        if val is None or (isinstance(val, float) and np.isnan(val)):
+            return "N/A"
+        # If < 1 it's in decimal fraction form (old yfinance); if ≥ 1 treat as % directly
+        return f"{val:.2f}%" if val >= 1 else f"{val * 100:.2f}%"
+
+    def safe_pct(key):
+        v = g(key)
+        if v is None:
+            return "N/A"
+        try:
+            return fmt_pct(v)
+        except Exception:
+            return "N/A"
+
+    # ── Key metrics grid ──────────────────────────────────────────────────────
     col1, col2, col3, col4 = st.columns(4)
     with col1:
         st.metric("Market Cap",    fmt_currency(g("marketCap")))
@@ -713,36 +1073,49 @@ def show_fundamentals(info: dict):
         st.metric("EPS (TTM)",     fmt_num(g("trailingEps")))
         st.metric("Revenue",       fmt_currency(g("totalRevenue")))
     with col3:
-        st.metric("Div. Yield",    fmt_pct(g("dividendYield")))
+        st.metric("Div. Yield",    fmt_div(g("dividendYield")))
         st.metric("Beta",          fmt_num(g("beta")))
-        st.metric("Profit Margin", fmt_pct(g("profitMargins")))
+        st.metric("Profit Margin", safe_pct("profitMargins"))
     with col4:
         st.metric("52W High",      fmt_num(g("fiftyTwoWeekHigh")))
         st.metric("52W Low",       fmt_num(g("fiftyTwoWeekLow")))
-        st.metric("Avg Volume",    f"{g('averageVolume', 0):,}" if g("averageVolume") else "N/A")
+        st.metric("Avg Volume",    f"{g('averageVolume'):,}" if g("averageVolume") else "N/A")
 
-    # Company info expander
-    with st.expander("Company Details"):
+    st.markdown("---")
+
+    # ── Valuation snapshot bar ────────────────────────────────────────────────
+    pe  = g("trailingPE")
+    pb  = g("priceToBook")
+    eps = g("trailingEps")
+    if any(v is not None for v in [pe, pb, eps]):
+        vc1, vc2, vc3, vc4 = st.columns(4)
+        vc1.metric("Trailing P/E",  fmt_num(pe),  help="Lower = cheaper vs earnings")
+        vc2.metric("Price/Book",    fmt_num(pb),  help="< 1 = trading below book value")
+        vc3.metric("EPS (TTM)",     fmt_num(eps), help="Earnings per share, trailing 12 months")
+        vc4.metric("Total Debt",    fmt_currency(g("totalDebt")))
+
+    # ── Company info expander ─────────────────────────────────────────────────
+    with st.expander("Company Details", expanded=True):
         cols = st.columns(2)
         with cols[0]:
-            st.write(f"**Sector:**      {g('sector', 'N/A')}")
-            st.write(f"**Industry:**    {g('industry', 'N/A')}")
-            st.write(f"**Employees:**   {g('fullTimeEmployees', 'N/A'):,}" if g("fullTimeEmployees") else "**Employees:** N/A")
-            st.write(f"**Country:**     {g('country', 'N/A')}")
-            st.write(f"**Exchange:**    {g('exchange', 'N/A')}")
-            st.write(f"**Currency:**    {g('currency', 'N/A')}")
+            st.markdown(f"**Sector:** {g('sector', 'N/A')}")
+            st.markdown(f"**Industry:** {g('industry', 'N/A')}")
+            st.markdown(f"**Employees:** {g('fullTimeEmployees', 0):,}" if g("fullTimeEmployees") else "**Employees:** N/A")
+            st.markdown(f"**Country:** {g('country', 'N/A')}")
+            st.markdown(f"**Exchange:** {g('exchange', 'N/A')}")
+            st.markdown(f"**Currency:** {g('currency', 'N/A')}")
         with cols[1]:
-            st.write(f"**Free Cash Flow:** {fmt_currency(g('freeCashflow'))}")
-            st.write(f"**Operating CF:**   {fmt_currency(g('operatingCashflow'))}")
-            st.write(f"**Total Debt:**     {fmt_currency(g('totalDebt'))}")
-            st.write(f"**ROE:**            {fmt_pct(g('returnOnEquity'))}")
-            st.write(f"**ROA:**            {fmt_pct(g('returnOnAssets'))}")
-            st.write(f"**Gross Margin:**   {fmt_pct(g('grossMargins'))}")
+            st.markdown(f"**Gross Margin:** {safe_pct('grossMargins')}")
+            st.markdown(f"**Operating Margin:** {safe_pct('operatingMargins')}")
+            st.markdown(f"**Profit Margin:** {safe_pct('profitMargins')}")
+            st.markdown(f"**ROE:** {safe_pct('returnOnEquity')}")
+            st.markdown(f"**ROA:** {safe_pct('returnOnAssets')}")
+            st.markdown(f"**Operating CF:** {fmt_currency(g('operatingCashflow'))}")
 
         summary = g("longBusinessSummary", "")
         if summary:
             st.markdown("**About:**")
-            st.write(summary[:600] + ("..." if len(summary) > 600 else ""))
+            st.info(summary[:700] + ("…" if len(summary) > 700 else ""))
 
 
 # ── Signals Panel ──────────────────────────────────────────────────────────────
@@ -910,6 +1283,9 @@ def main():
 
     df     = add_indicators(df)
     levels = calculate_levels(df, method=sl_method, atr_mult_sl=atr_mult_sl)
+    rec    = calculate_recommendation(df, info)
+    risk   = calculate_risk_score(df, info)
+    alerts = detect_alerts(df)
 
     # ── Stock header ──────────────────────────────────────────────────────────
     name  = info.get("longName", ticker)
@@ -928,6 +1304,8 @@ def main():
     col_d.metric("Open",        f"{sym}{float(df['Open'].iloc[-1]):,.2f}")
     col_e.metric("High / Low",  f"{sym}{float(df['High'].iloc[-1]):,.2f} / {sym}{float(df['Low'].iloc[-1]):,.2f}")
 
+    st.markdown("---")
+    show_recommendation_risk(rec, risk)
     st.markdown("---")
 
     # ── Tabs ──────────────────────────────────────────────────────────────────
@@ -954,6 +1332,8 @@ def main():
         )
 
     with tab3:
+        show_alerts(alerts)
+        st.markdown("---")
         signals = generate_signals(df)
         show_signals(signals)
         st.markdown("---")
