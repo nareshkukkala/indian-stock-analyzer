@@ -6,4 +6,4 @@ services:
     startCommand: python -m streamlit run app.py --server.port $PORT --server.address 0.0.0.0 --server.headless true
     envVars:
       - key: PYTHON_VERSION
-        value: 3.10.0
+        value: 3.11.8
