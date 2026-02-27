@@ -164,36 +164,41 @@ def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
     high  = df["High"].squeeze()
     low   = df["Low"].squeeze()
     vol   = df["Volume"].squeeze()
+    n     = len(df)
+
+    def w(window):
+        """Cap window to available rows (minimum 2)."""
+        return max(2, min(window, n))
 
     # Moving Averages
-    df["SMA20"]  = ta.trend.sma_indicator(close, window=20)
-    df["SMA50"]  = ta.trend.sma_indicator(close, window=50)
-    df["SMA200"] = ta.trend.sma_indicator(close, window=200)
-    df["EMA20"]  = ta.trend.ema_indicator(close, window=20)
+    df["SMA20"]  = ta.trend.sma_indicator(close, window=w(20))
+    df["SMA50"]  = ta.trend.sma_indicator(close, window=w(50))
+    df["SMA200"] = ta.trend.sma_indicator(close, window=w(200))
+    df["EMA20"]  = ta.trend.ema_indicator(close, window=w(20))
 
     # Bollinger Bands
-    bb = ta.volatility.BollingerBands(close, window=20, window_dev=2)
+    bb = ta.volatility.BollingerBands(close, window=w(20), window_dev=2)
     df["BB_upper"] = bb.bollinger_hband()
     df["BB_lower"] = bb.bollinger_lband()
     df["BB_mid"]   = bb.bollinger_mavg()
 
     # RSI
-    df["RSI"] = ta.momentum.rsi(close, window=14)
+    df["RSI"] = ta.momentum.rsi(close, window=w(14))
 
     # MACD
-    macd = ta.trend.MACD(close)
+    macd = ta.trend.MACD(close, window_slow=w(26), window_fast=w(12), window_sign=w(9))
     df["MACD"]        = macd.macd()
     df["MACD_signal"] = macd.macd_signal()
     df["MACD_hist"]   = macd.macd_diff()
 
     # Volume SMA
-    df["Vol_SMA20"] = ta.trend.sma_indicator(vol, window=20)
+    df["Vol_SMA20"] = ta.trend.sma_indicator(vol, window=w(20))
 
     # ATR
-    df["ATR"] = ta.volatility.average_true_range(high, low, close, window=14)
+    df["ATR"] = ta.volatility.average_true_range(high, low, close, window=w(14))
 
     # Stochastic
-    stoch = ta.momentum.StochasticOscillator(high, low, close, window=14, smooth_window=3)
+    stoch = ta.momentum.StochasticOscillator(high, low, close, window=w(14), smooth_window=w(3))
     df["Stoch_K"] = stoch.stoch()
     df["Stoch_D"] = stoch.stoch_signal()
 
