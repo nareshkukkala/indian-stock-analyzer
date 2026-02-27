@@ -813,7 +813,7 @@ def show_comparison(stock_df: pd.DataFrame, stock_ticker: str, index_name: str, 
         legend=dict(orientation="h"),
         margin=dict(l=40, r=20, t=40, b=20),
     )
-    st.plotly_chart(fig, use_container_width=True)
+    st.plotly_chart(fig, use_container_width=True, key="comparison_chart")
 
 
 # ── Returns Analysis ───────────────────────────────────────────────────────────
@@ -850,7 +850,7 @@ def show_returns(df: pd.DataFrame):
             yaxis_title="Return (%)",
             margin=dict(l=40, r=20, t=20, b=20),
         )
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, use_container_width=True, key="returns_chart")
 
 
 # ── Volatility Section ─────────────────────────────────────────────────────────
@@ -876,7 +876,7 @@ def show_volatility(df: pd.DataFrame):
         paper_bgcolor="#0E1117", plot_bgcolor="#0E1117",
         showlegend=False, margin=dict(l=40, r=20, t=50, b=20),
     )
-    st.plotly_chart(fig, use_container_width=True)
+    st.plotly_chart(fig, use_container_width=True, key="volatility_chart")
 
 
 # ── Main App ───────────────────────────────────────────────────────────────────
@@ -935,6 +935,7 @@ def main():
         st.plotly_chart(
             build_price_chart(df, ticker, chart_type, show_bb, show_ma, levels=chart_levels),
             use_container_width=True,
+            key="price_chart_tab1",
         )
         show_comparison(df, ticker, compare_index, period, interval)
 
@@ -944,6 +945,7 @@ def main():
         st.plotly_chart(
             build_price_chart(df, ticker, chart_type, show_bb, show_ma, levels=levels),
             use_container_width=True,
+            key="price_chart_tab2",
         )
 
     with tab3:
@@ -952,9 +954,9 @@ def main():
         st.markdown("---")
         col1, col2 = st.columns(2)
         with col1:
-            st.plotly_chart(build_macd_chart(df), use_container_width=True)
+            st.plotly_chart(build_macd_chart(df), use_container_width=True, key="macd_chart")
         with col2:
-            st.plotly_chart(build_stoch_chart(df), use_container_width=True)
+            st.plotly_chart(build_stoch_chart(df), use_container_width=True, key="stoch_chart")
 
     with tab4:
         show_fundamentals(info)
