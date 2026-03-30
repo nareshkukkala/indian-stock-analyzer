@@ -1,0 +1,48 @@
+@import "tailwindcss";
+
+:root {
+  --accent: #FF6B35;
+  --bg: #0E1117;
+  --surface: #1E1E2E;
+  --border: rgba(255, 255, 255, 0.08);
+}
+
+body {
+  background: var(--bg);
+  color: #e0e0e0;
+}
+
+::-webkit-scrollbar { width: 6px; height: 6px; }
+::-webkit-scrollbar-track { background: var(--bg); }
+::-webkit-scrollbar-thumb { background: #333; border-radius: 3px; }
+
+.tab-btn {
+  padding: 0.4rem 1rem;
+  font-size: 0.875rem;
+  font-weight: 500;
+  border-radius: 6px;
+  transition: all 0.15s;
+  white-space: nowrap;
+}
+.tab-btn.active {
+  background: var(--accent);
+  color: white;
+}
+.tab-btn:not(.active) {
+  color: #999;
+}
+.tab-btn:not(.active):hover {
+  color: #e0e0e0;
+  background: rgba(255, 255, 255, 0.06);
+}
+
+.level-card {
+  border-radius: 10px;
+  padding: 0.8rem 1rem;
+  text-align: center;
+}
+.level-curr { background: rgba(255,107,53,0.12); border: 1px solid #FF6B35; }
+.level-sl   { background: rgba(255,23,68,0.12);  border: 1px solid #FF1744; }
+.level-t1   { background: rgba(0,200,83,0.08);   border: 1px solid #00C853; }
+.level-t2   { background: rgba(0,200,83,0.14);   border: 1px solid #00C853; }
+.level-t3   { background: rgba(0,200,83,0.20);   border: 1px solid #00C853; }
