@@ -5,12 +5,16 @@ import type {
   MarketOverview,
 } from "@/types";
 
-const BASE = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8000";
+// Empty string = same-origin (Vercel Python functions at /api/*).
+// Set NEXT_PUBLIC_API_URL=http://localhost:8000 in .env.local for local dev.
+const BASE = process.env.NEXT_PUBLIC_API_URL ?? "";
 
 async function get<T>(path: string, params: Record<string, string | number> = {}): Promise<T> {
-  const url = new URL(`${BASE}${path}`);
+  const fullPath = `${BASE}${path}`;
+  const url = BASE ? new URL(fullPath) : new URL(fullPath, "http://localhost");
   Object.entries(params).forEach(([k, v]) => url.searchParams.set(k, String(v)));
-  const res = await fetch(url.toString(), { next: { revalidate: 0 } });
+  const finalUrl = BASE ? url.toString() : url.pathname + url.search;
+  const res = await fetch(finalUrl, { next: { revalidate: 0 } });
   if (!res.ok) {
     const err = await res.json().catch(() => ({ detail: res.statusText }));
     throw new Error(err.detail ?? "API error");
