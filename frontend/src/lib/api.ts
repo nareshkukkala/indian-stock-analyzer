@@ -10,11 +10,11 @@ import type {
 const BASE = process.env.NEXT_PUBLIC_API_URL ?? "";
 
 async function get<T>(path: string, params: Record<string, string | number> = {}): Promise<T> {
-  const fullPath = `${BASE}${path}`;
-  const url = BASE ? new URL(fullPath) : new URL(fullPath, "http://localhost");
-  Object.entries(params).forEach(([k, v]) => url.searchParams.set(k, String(v)));
-  const finalUrl = BASE ? url.toString() : url.pathname + url.search;
-  const res = await fetch(finalUrl, { next: { revalidate: 0 } });
+  const qs = new URLSearchParams(
+    Object.entries(params).map(([k, v]) => [k, String(v)])
+  ).toString();
+  const finalUrl = `${BASE}${path}${qs ? "?" + qs : ""}`;
+  const res = await fetch(finalUrl, { cache: "no-store" });
   if (!res.ok) {
     const err = await res.json().catch(() => ({ detail: res.statusText }));
     throw new Error(err.detail ?? "API error");
